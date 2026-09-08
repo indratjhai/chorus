@@ -216,7 +216,18 @@ export type AgentEvent =
         costUsd?: number;
       };
     }
-  | { type: 'error'; kind: string; message: string };
+  | {
+      type: 'error';
+      kind: string;
+      message: string;
+      /**
+       * CLI-specific failure subtype when the transport reports one — e.g.
+       * claude's result `subtype` (`error_max_turns`,
+       * `error_during_execution`). Lets a caller tell a turn-cap stop from
+       * an API failure without parsing the message.
+       */
+      subtype?: string;
+    };
 
 /**
  * Options for `AgentShim.runHeadless`. Mirrors `AgentSpawnOptions` for the
@@ -248,8 +259,27 @@ export interface HeadlessSpawnOptions {
   abortSignal?: AbortSignal;
   /** Hard timeout — process is killed after this. Default 600_000 (10 min). */
   timeoutMs?: number;
+  /**
+   * Hard cap on agent-loop turns (claude `--max-turns`). Backstop against a
+   * reviewer that crawls the whole repo and never converges: without it, a
+   * thorough review template can push claude-opus into 17+ tool-call turns
+   * that burn the entire timeout mid-exploration and get captured EMPTY.
+   * Only the claude shim maps this today; other shims ignore it.
+   */
+  maxTurns?: number;
   /** Per-account isolation (codex multi-auth). */
   accountId?: string;
+  /**
+   * Extra directories the CLI may READ (not the cwd). Reviewers pass the
+   * chat's `repoPath` here so a sandboxed CLI (notably gemini, whose
+   * workspace-trust is scoped to cwd) can read the codebase the diff came
+   * from WITHOUT us moving cwd to the repo. Keeping cwd = the per-chat dir
+   * preserves the `./answer.md` capture contract and the chat-dir write
+   * boundary. Each shim maps this to its own flag: gemini
+   * `--include-directories`, claude `--add-dir`. Codex reads within its
+   * workspace-write sandbox already and stubs regardless, so it ignores this.
+   */
+  readDirs?: string[];
 }
 
 /**

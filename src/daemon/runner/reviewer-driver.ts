@@ -15,6 +15,7 @@ import * as participantAborts from '../participant-aborts.js';
 import type { TmuxManager } from '../tmux-types.js';
 import { buildReviewerAsk } from './prompt-builder.js';
 import { runReviewerHeadless } from './reviewer.js';
+import { runReviewerWithStubRetry } from './reviewer-stub.js';
 import {
   release as releaseFallbackClaim,
   tryClaim as tryClaimFallbackTarget,
@@ -62,6 +63,7 @@ export async function runReviewers(
   onEvent: (e: RunnerEvent) => void,
   abortSignal: AbortSignal,
   templateFallbackReviewer?: ReadonlyArray<{ lineage: string; models: string[] }>,
+  repoPath?: string,
 ): Promise<{ agreed: boolean; summary: string; allFailed: boolean }> {
   if (!phase.reviewer || phase.reviewer.candidates.length === 0) {
     return { agreed: true, summary: '', allFailed: false };
@@ -150,6 +152,7 @@ export async function runReviewers(
         onEvent,
         abortSignal,
         templateFallbackReviewer,
+        repoPath,
       );
       reviews.push({
         reviewer: `${candidate.lineage}-${idx}`,
@@ -225,6 +228,7 @@ async function runReviewer(
   onEvent: (e: RunnerEvent) => void,
   abortSignal: AbortSignal,
   templateFallbackReviewer?: ReadonlyArray<{ lineage: string; models: string[] }>,
+  repoPath?: string,
 ): Promise<boolean | null> {
   // Returns:
   //   true  = reviewer ran and approved
@@ -397,6 +401,7 @@ async function runReviewer(
     doerOutput,
     filesBlock,
     reviewerPersonaPrompt,
+    repoPath,
   );
   fs.writeFileSync(askFile, ask);
 
@@ -484,20 +489,55 @@ async function runReviewer(
             const entryShim = entry.lineage === candidate.lineage
               ? shim
               : pickShimForVoice(entry.lineage as Lineage, entry.model);
-            return await runReviewerHeadless({
-              shim: entryShim,
-              chatId,
-              phase,
-              round,
-              reviewerIdx,
-              candidateLineage: entry.lineage,
-              candidateModel: entry.model,
-              agentName,
-              askContent: ask,
+            const runOnce = () =>
+              runReviewerHeadless({
+                shim: entryShim,
+                chatId,
+                phase,
+                round,
+                reviewerIdx,
+                candidateLineage: entry.lineage,
+                candidateModel: entry.model,
+                agentName,
+                askContent: ask,
+                answerFile,
+                reviewerDir,
+                repoPath,
+                abortSignal: handle.signal,
+                onEvent,
+              });
+            // A verdict-only stub (no findings, a failed verification note)
+            // is re-run in place — same lineage, model and prompt — before
+            // it counts as this slot's answer. Other slots are untouched.
+            // A stub that survives its retries is kept but stamped
+            // DEGRADED so quorum reads it as a weak cell, not a clean pass.
+            return await runReviewerWithStubRetry(runOnce, {
               answerFile,
               reviewerDir,
-              abortSignal: handle.signal,
-              onEvent,
+              round,
+              lineage: entry.lineage,
+              model: entry.model,
+              agent: `${agentName}-${reviewerIdx}`,
+              chatId,
+              onStubRetry: (attempt, remaining) => {
+                onEvent({
+                  chatId,
+                  type: 'cli_warning',
+                  payload: {
+                    phaseId: phase.id,
+                    round,
+                    role: 'reviewer',
+                    agent: `${agentName}-${reviewerIdx}`,
+                    reason: 'stub_retry',
+                    fromLineage: entry.lineage,
+                    toLineage: entry.lineage,
+                    fromModel: entry.model ?? '(default)',
+                    toModel: entry.model ?? '(default)',
+                    message: `Reviewer ${entry.lineage}/${entry.model ?? '(default)'} returned a verdict with no findings; re-running the cell (attempt ${attempt}, ${remaining} retr${remaining === 1 ? 'y' : 'ies'} left).`,
+                  },
+                  ts: Date.now(),
+                });
+              },
             });
           } finally {
             // Release whether the attempt succeeded, returned null, or
@@ -583,7 +623,12 @@ async function runReviewer(
     shim,
     spawnOpts: {
       sessionName,
-      cwd: reviewerDir,
+      // When the chat was created with a repoPath, reviewers run CWD'd
+      // to the repo so Read/Bash/Grep can see the codebase the diff
+      // came from. Mirrors the doer-driver pattern. Without this,
+      // reviewers see only `artifact` + `files`-block-packed-into-prompt;
+      // they can't grep adjacent code or check pattern fit dynamically.
+      cwd: repoPath ?? reviewerDir,
       model: candidate.models?.[0],
       sandbox: perms.sandboxProfile,
       autoApprove: perms.autoApprovePrompts,

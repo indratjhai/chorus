@@ -10,7 +10,10 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import type { StandardPhase } from '../../lib/template-schema.js';
-import { DEFAULT_PHASE_TIMEOUT_MS } from '../../lib/template-schema.js';
+import {
+  DEFAULT_PHASE_TIMEOUT_MS,
+  DEFAULT_REVIEWER_MAX_TURNS,
+} from '../../lib/template-schema.js';
 import type { AgentShim } from '../agents/types.js';
 import { getPermissions } from '../../lib/settings/permissions.js';
 import {
@@ -24,6 +27,27 @@ import { StreamFileWriter } from './stream-file-writer.js';
 import { verdictFromReviewerText } from './verdict.js';
 import type { RunnerEvent } from './types.js';
 
+/**
+ * Resolve the reviewer turn cap: phase override → CHORUS_REVIEWER_MAX_TURNS
+ * → DEFAULT_REVIEWER_MAX_TURNS. Anything that is not a positive integer
+ * falls through to the next source, so a typo'd env var cannot silently
+ * disable the backstop or set it to 0.
+ */
+export function resolveReviewerMaxTurns(
+  phaseOverride: number | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): number {
+  if (Number.isInteger(phaseOverride) && (phaseOverride as number) > 0) {
+    return phaseOverride as number;
+  }
+  const raw = env.CHORUS_REVIEWER_MAX_TURNS;
+  if (raw !== undefined && /^\d+$/.test(raw.trim())) {
+    const n = Number.parseInt(raw.trim(), 10);
+    if (Number.isInteger(n) && n > 0) return n;
+  }
+  return DEFAULT_REVIEWER_MAX_TURNS;
+}
+
 export async function runReviewerHeadless(args: {
   shim: AgentShim;
   chatId: string;
@@ -36,6 +60,14 @@ export async function runReviewerHeadless(args: {
   askContent: string;
   answerFile: string;
   reviewerDir: string;
+  /**
+   * When the chat was created with a repoPath, reviewers get READ access to
+   * it (mapped to each CLI's read-dir flag) so they can inspect the codebase
+   * the diff came from. We deliberately do NOT make it the cwd — cwd stays
+   * `reviewerDir` so `./answer.md` capture and the chat-dir write boundary
+   * are preserved. See HeadlessSpawnOptions.readDirs.
+   */
+  repoPath?: string;
   abortSignal: AbortSignal;
   onEvent: (e: RunnerEvent) => void;
 }): Promise<boolean | null> {
@@ -51,6 +83,7 @@ export async function runReviewerHeadless(args: {
     askContent,
     answerFile,
     reviewerDir,
+    repoPath,
     abortSignal,
     onEvent,
   } = args;
@@ -80,17 +113,6 @@ export async function runReviewerHeadless(args: {
   fs.writeFileSync(answerFile, '');
   const writer = new StreamFileWriter(answerFile);
 
-  const stream = shim.runHeadless({
-    cwd: reviewerDir,
-    promptText: askContent,
-    model: candidateModel,
-    sandbox: perms.sandboxProfile,
-    autoApprove: perms.autoApprovePrompts,
-    networkAccess: perms.networkAccess,
-    abortSignal,
-    timeoutMs: phase.timeoutMs ?? DEFAULT_PHASE_TIMEOUT_MS,
-  });
-
   // Safety net: if the stream closes without emitting ANY event (no text,
   // no error, no message_done), the reviewer subprocess silently produced
   // nothing — most often a CLI that wrote model output to /dev/tty instead
@@ -101,6 +123,39 @@ export async function runReviewerHeadless(args: {
   let eventCount = 0;
 
   try {
+    // INSIDE the try on purpose: a shim's runHeadless can throw
+    // SYNCHRONOUSLY before the child ever spawns (observed: claude's
+    // pre-trust marker write hitting EROFS on the orchestrator pods'
+    // read-only ~/.claude.json mount). When this call sat outside the
+    // try, that throw skipped the catch AND the finally's failure-stub
+    // writer — the reviewer died as a silent null with a 0-byte
+    // answer.md and no _attempts.jsonl row. Inside the try, the same
+    // throw lands in the catch below: cli_error event, stub, attempts
+    // trail — a diagnosable failure instead of an invisible one.
+    const stream = shim.runHeadless({
+      // cwd stays the per-chat reviewer dir (NOT repoPath) so `./answer.md`
+      // capture and the chat-dir write boundary are preserved. repoPath is
+      // granted as a READ-only extra dir via readDirs instead.
+      cwd: reviewerDir,
+      readDirs: repoPath ? [repoPath] : undefined,
+      promptText: askContent,
+      model: candidateModel,
+      sandbox: perms.sandboxProfile,
+      autoApprove: perms.autoApprovePrompts,
+      networkAccess: perms.networkAccess,
+      abortSignal,
+      timeoutMs: phase.timeoutMs ?? DEFAULT_PHASE_TIMEOUT_MS,
+      // Turn backstop (claude shim only). A reviewer with worktree read
+      // access spends a turn per file it opens, so the cap has to scale
+      // with the diff: the old fixed 50 was exhausted on a 58-file PR before
+      // a single finding was written, and the failure surfaced as a bare
+      // `claude_result_error`. Phase override → env → default; the phase
+      // timeout still bounds a pathological loop. Incremental capture
+      // (--include-partial-messages) means a stopped run keeps whatever it
+      // streamed.
+      maxTurns: resolveReviewerMaxTurns(phase.reviewerMaxTurns),
+    });
+
     for await (const event of stream) {
       eventCount += 1;
       if (event.type === 'text_delta') {
@@ -163,17 +218,40 @@ export async function runReviewerHeadless(args: {
             );
           }
         } else {
-          // Don't double-stamp the sentinel. Codex (and any CLI that
-          // ends its own output with "## DONE") would otherwise ship
-          // an answer with `... ## DONE\n\n\n## DONE\n` — the verdict
-          // heuristic doesn't care, but it looks unprofessional in the
-          // cockpit and breaks tools that grep for a single sentinel.
+          // Keep whichever is more content-bearing: a reviewer that used
+          // its Write tool per the template ("Mechanism 1") saves the full
+          // structured findings to answer.md and then emits a minimal
+          // verdict-only final message. Overwriting unconditionally here
+          // destroyed that tool-written review and left a 25-byte stub —
+          // the degraded-run failure observed on every Claude reviewer run
+          // of 2026-06-06. The template prompt already documents this
+          // longer-content-wins behavior; this makes the code match it.
+          const existing = fs.existsSync(answerFile)
+            ? fs.readFileSync(answerFile, 'utf-8')
+            : '';
           const trimmedTail = event.finalText.replace(/\s+$/, '');
-          const alreadyHasSentinel = /\n##\s*DONE\s*$/i.test(trimmedTail);
-          const body = alreadyHasSentinel
-            ? `${trimmedTail}\n`
-            : `${trimmedTail}\n\n## DONE\n`;
-          fs.writeFileSync(answerFile, body);
+          if (existing.trim().length > trimmedTail.length) {
+            // Tool-written findings (or streamed deltas) on disk are longer
+            // than the final message — preserve them, just ensure the
+            // sentinel is stamped once.
+            if (!/\n##\s*DONE\s*\n?$/i.test(existing.trimEnd())) {
+              fs.appendFileSync(
+                answerFile,
+                existing.endsWith('\n') ? '\n## DONE\n' : '\n\n## DONE\n',
+              );
+            }
+          } else {
+            // Don't double-stamp the sentinel. Codex (and any CLI that
+            // ends its own output with "## DONE") would otherwise ship
+            // an answer with `... ## DONE\n\n\n## DONE\n` — the verdict
+            // heuristic doesn't care, but it looks unprofessional in the
+            // cockpit and breaks tools that grep for a single sentinel.
+            const alreadyHasSentinel = /\n##\s*DONE\s*$/i.test(trimmedTail);
+            const body = alreadyHasSentinel
+              ? `${trimmedTail}\n`
+              : `${trimmedTail}\n\n## DONE\n`;
+            fs.writeFileSync(answerFile, body);
+          }
         }
         // Persist runtime stats next to the answer so the cockpit run-
         // artifacts route can surface "12.4s · 3.4k tok" on the card even
@@ -341,6 +419,31 @@ export async function runReviewerHeadless(args: {
           `Likely a transport bug (e.g. opencode 1.14.x writes JSON only to a TTY) ` +
           `or a silent abort. Check the CLI's own log for details.`,
       };
+    }
+    // The reviewer streamed real findings and THEN the CLI failed (turn cap,
+    // timeout, API error mid-run). The deltas are already on disk via the
+    // writer; stamp a DEGRADED block — deliberately without `## DONE` — so a
+    // reader sees both the partial review and why it stopped, instead of
+    // the findings being indistinguishable from a clean answer or thrown
+    // away behind a FAILED stub. `errored` stays true, so quorum logic is
+    // unchanged: this slot still counts as failed.
+    if (errored && accumulated.trim().length >= 400 && (!finalText || finalText.length === 0)) {
+      try {
+        const existing = fs.readFileSync(answerFile, 'utf-8');
+        if (!/##\s*REVIEWER DEGRADED/i.test(existing)) {
+          fs.appendFileSync(
+            answerFile,
+            (existing.endsWith('\n') ? '\n' : '\n\n') +
+              `## REVIEWER DEGRADED\n` +
+              `**Kind:** ${errorSummary?.kind ?? 'unknown'}\n` +
+              `**Lineage:** ${candidateLineage}\n` +
+              `**Model:** ${candidateModel ?? '(default)'}\n` +
+              `\n${errorSummary?.message ?? '(no message captured)'}\n`,
+          );
+        }
+      } catch {
+        /* best-effort — the streamed findings are already on disk */
+      }
     }
     // When the subprocess died without producing any content, write the
     // error summary to answer.md so the chat dir is self-explanatory.
