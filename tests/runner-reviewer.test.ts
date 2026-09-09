@@ -122,31 +122,31 @@ describe('runReviewerHeadless', () => {
       delete process.env.CHORUS_REVIEWER_MAX_TURNS;
     });
 
-    it('defaults to DEFAULT_REVIEWER_MAX_TURNS (120)', async () => {
+    it('defaults to DEFAULT_REVIEWER_MAX_TURNS (200)', async () => {
       const handle = makeFakeShim({ events: happyPathEvents(`${PADDING}\nlgtm\n## DONE`) });
       await callReviewer(handle);
-      expect(handle.calls[0].options.maxTurns).toBe(120);
+      expect(handle.calls[0].options.maxTurns).toBe(200);
     });
 
     it('honours CHORUS_REVIEWER_MAX_TURNS and ignores a non-integer value', async () => {
-      process.env.CHORUS_REVIEWER_MAX_TURNS = '200';
+      process.env.CHORUS_REVIEWER_MAX_TURNS = '150';
       let handle = makeFakeShim({ events: happyPathEvents(`${PADDING}\nlgtm\n## DONE`) });
       await callReviewer(handle);
-      expect(handle.calls[0].options.maxTurns).toBe(200);
+      expect(handle.calls[0].options.maxTurns).toBe(150);
 
       process.env.CHORUS_REVIEWER_MAX_TURNS = '2junk';
       handle = makeFakeShim({ events: happyPathEvents(`${PADDING}\nlgtm\n## DONE`) });
       await callReviewer(handle);
-      expect(handle.calls[0].options.maxTurns).toBe(120);
+      expect(handle.calls[0].options.maxTurns).toBe(200);
 
       process.env.CHORUS_REVIEWER_MAX_TURNS = '0';
       handle = makeFakeShim({ events: happyPathEvents(`${PADDING}\nlgtm\n## DONE`) });
       await callReviewer(handle);
-      expect(handle.calls[0].options.maxTurns).toBe(120);
+      expect(handle.calls[0].options.maxTurns).toBe(200);
     });
 
     it('lets phase.reviewerMaxTurns beat the env var', async () => {
-      process.env.CHORUS_REVIEWER_MAX_TURNS = '200';
+      process.env.CHORUS_REVIEWER_MAX_TURNS = '150';
       const handle = makeFakeShim({ events: happyPathEvents(`${PADDING}\nlgtm\n## DONE`) });
       const phaseWithCap: StandardPhase = { ...fixturePhase, reviewerMaxTurns: 33 };
       await runReviewerHeadless({

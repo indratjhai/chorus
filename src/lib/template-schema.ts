@@ -58,11 +58,11 @@ const PhaseTimeoutSchema = z
  *
  * Was 50. A reviewer with worktree read access spends one turn per file it
  * opens, so a 50-plus-file diff exhausted the cap before the reviewer wrote
- * a line and surfaced as a bare `claude_result_error`. 120 leaves room for
+ * a line and surfaced as a bare `claude_result_error`. 200 leaves room for
  * a thorough crawl of a large PR while the phase timeout still bounds a
  * pathological loop.
  */
-export const DEFAULT_REVIEWER_MAX_TURNS = 120;
+export const DEFAULT_REVIEWER_MAX_TURNS = 200;
 
 /**
  * Bounds on the optional per-phase reviewer turn cap. 1 catches a typo'd
